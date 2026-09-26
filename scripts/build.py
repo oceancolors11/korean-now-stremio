@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
+import cv2
+import numpy as np
 
 
 # ============================================================
@@ -392,7 +394,7 @@ for basic in candidates[:100]:
                     "images,videos,credits",
 
                 "include_image_language":
-                    "en,null,ko",
+                    "ar,en,null,ko",
             }
         )
 
@@ -534,17 +536,222 @@ print(
 # Backdrop selection
 # ============================================================
 
+BACKDROP_CACHE = {}
+
+
+def analyze_backdrop(url):
+    """
+    Lightweight visual analysis for Hero suitability.
+
+    The goal is not to identify the "perfect" image, but to avoid:
+    - blurry/low-quality images
+    - poster-like crops
+    - faces pushed against edges
+    - faces in the title-safe area
+    - very busy/text-heavy title areas
+    """
+    if not url:
+        return {
+            "score": -100,
+            "width": 0,
+            "height": 0,
+        }
+
+    if url in BACKDROP_CACHE:
+        return BACKDROP_CACHE[url]
+
+    result = {
+        "score": 0,
+        "width": 0,
+        "height": 0,
+    }
+
+    try:
+        r = session.get(url, timeout=15)
+        r.raise_for_status()
+
+        data = np.frombuffer(r.content, dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+        if image is None:
+            BACKDROP_CACHE[url] = result
+            return result
+
+        height, width = image.shape[:2]
+        result["width"] = width
+        result["height"] = height
+
+        # Reject images that are too small for a large Hero.
+        if width < 1000 or height < 500:
+            result["score"] -= 80
+
+        # Strong preference for proper cinematic landscape images.
+        ratio = width / height if height else 0
+        if 1.68 <= ratio <= 1.86:
+            result["score"] += 18
+        elif ratio < 1.55:
+            result["score"] -= 35
+
+        # Downscale for inexpensive visual analysis.
+        scale = min(1.0, 900 / max(width, 1))
+        if scale < 1:
+            small = cv2.resize(
+                image,
+                (
+                    max(1, int(width * scale)),
+                    max(1, int(height * scale)),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            small = image
+
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        # Sharpness: very low Laplacian variance often means a soft/blurry image.
+        sharpness = float(
+            cv2.Laplacian(gray, cv2.CV_64F).var()
+        )
+
+        if sharpness >= 180:
+            result["score"] += 16
+        elif sharpness >= 90:
+            result["score"] += 8
+        elif sharpness < 40:
+            result["score"] -= 28
+        elif sharpness < 65:
+            result["score"] -= 14
+
+        h, w = gray.shape[:2]
+
+        # Title-safe zone: left side, avoiding the extreme top and bottom.
+        # Nuvio can place title/logo information here, so calmer imagery
+        # and fewer faces are preferred.
+        x2 = int(w * 0.58)
+        y1 = int(h * 0.14)
+        y2 = int(h * 0.68)
+
+        safe = gray[y1:y2, :x2]
+
+        if safe.size:
+            # Edge density is a useful proxy for visual clutter.
+            edges = cv2.Canny(safe, 80, 160)
+            edge_density = float(
+                cv2.countNonZero(edges) / edges.size
+            )
+
+            if edge_density < 0.07:
+                result["score"] += 16
+            elif edge_density < 0.12:
+                result["score"] += 8
+            elif edge_density > 0.22:
+                result["score"] -= 18
+            elif edge_density > 0.17:
+                result["score"] -= 9
+
+            # Extreme local contrast can make title/logo readability worse.
+            brightness_std = float(safe.std())
+
+            if brightness_std < 38:
+                result["score"] += 12
+            elif brightness_std > 72:
+                result["score"] -= 12
+
+        # Face detection.
+        # Faces are not forbidden; we only penalize poor Hero placement.
+        try:
+            cascade_path = cv2.data.haarcascades + (
+                "haarcascade_frontalface_default.xml"
+            )
+            face_detector = cv2.CascadeClassifier(cascade_path)
+
+            faces = face_detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(
+                    max(24, int(w * 0.035)),
+                    max(24, int(h * 0.035)),
+                ),
+            )
+
+            for (fx, fy, fw, fh) in faces:
+                cx = fx + fw / 2
+                cy = fy + fh / 2
+
+                # Face touching an edge is bad for Hero cropping.
+                if (
+                    fx < w * 0.045
+                    or fy < h * 0.045
+                    or fx + fw > w * 0.955
+                    or fy + fh > h * 0.955
+                ):
+                    result["score"] -= 12
+
+                # Large face in the title-safe zone is strongly discouraged.
+                if (
+                    cx < w * 0.58
+                    and y1 <= cy <= y2
+                ):
+                    area_ratio = (
+                        (fw * fh) / max(w * h, 1)
+                    )
+
+                    if area_ratio > 0.16:
+                        result["score"] -= 24
+                    elif area_ratio > 0.08:
+                        result["score"] -= 14
+                    else:
+                        result["score"] -= 6
+
+        except Exception:
+            pass
+
+        # MSER text-like regions: this helps penalize backdrops with
+        # prominent baked-in typography without requiring OCR packages.
+        try:
+            mser = cv2.MSER_create()
+            regions, _ = mser.detectRegions(gray)
+
+            text_like = 0
+
+            for pts in regions[:250]:
+                x, y, rw, rh = cv2.boundingRect(pts)
+
+                if (
+                    x < w * 0.60
+                    and y > h * 0.08
+                    and y < h * 0.78
+                    and rw >= 8
+                    and rh >= 5
+                    and rw / max(rh, 1) >= 1.2
+                    and rw / max(rh, 1) <= 18
+                ):
+                    text_like += 1
+
+            if text_like > 45:
+                result["score"] -= 18
+            elif text_like > 28:
+                result["score"] -= 10
+            elif text_like < 12:
+                result["score"] += 5
+
+        except Exception:
+            pass
+
+    except Exception as e:
+        print("visual backdrop analysis failed:", e)
+
+    BACKDROP_CACHE[url] = result
+    return result
+
+
 def choose_backdrop(d):
 
     images = d.get("images") or {}
+    backdrops = images.get("backdrops") or []
 
-    backdrops = images.get(
-        "backdrops"
-    ) or []
-
-    # Fallback to the main TMDB backdrop.
     if not backdrops:
-
         if d.get("backdrop_path"):
             return img(
                 d["backdrop_path"],
@@ -553,8 +760,12 @@ def choose_backdrop(d):
 
         return None
 
+    candidates = []
 
-    def score(x):
+    for x in backdrops:
+        path = x.get("file_path")
+        if not path:
+            continue
 
         aspect_ratio = float(
             x.get("aspect_ratio") or 0
@@ -568,66 +779,110 @@ def choose_backdrop(d):
             x.get("height") or 0
         )
 
+        # Backdrop should be genuinely landscape.
+        if width < 1280 or height < 700:
+            continue
+
+        if aspect_ratio < 1.60 or aspect_ratio > 1.90:
+            continue
+
+        language = x.get("iso_639_1")
         vote_average = float(
             x.get("vote_average") or 0
         )
-
         vote_count = int(
             x.get("vote_count") or 0
         )
 
-        language = x.get(
-            "iso_639_1"
-        )
+        score_value = vote_average * 7
 
+        score_value += min(
+            vote_count,
+            100
+        ) * 0.08
 
-        score_value = (
-            vote_average * 8
-        )
+        # Strong preference for clean, neutral backdrops.
+        if language is None:
+            score_value += 16
+        elif language == "en":
+            score_value += 3
+        elif language in {"ko", "ar"}:
+            score_value -= 2
+        else:
+            score_value -= 5
 
-        score_value += (
-            min(vote_count, 100) * 0.08
-        )
-
-
-        # Ideal cinematic landscape ratio.
-        if 1.70 <= aspect_ratio <= 1.82:
-            score_value += 20
-
-
-        # Prefer large images.
         if width >= 1920:
+            score_value += 15
+        elif width >= 1600:
+            score_value += 9
+        else:
+            score_value += 3
+
+        if 1.70 <= aspect_ratio <= 1.82:
             score_value += 12
 
-        elif width >= 1280:
-            score_value += 6
+        # Analyze only the strongest metadata candidates first.
+        candidates.append(
+            (
+                score_value,
+                x
+            )
+        )
 
+    if not candidates:
+        if d.get("backdrop_path"):
+            return img(
+                d["backdrop_path"],
+                "w1920"
+            )
 
-        # Prefer wider images.
-        if width >= 1600 and height >= 700:
-            score_value += 4
+        return None
 
-
-        # Text-free / neutral language images
-        # are usually better for Hero backgrounds.
-        if language is None:
-            score_value += 8
-
-
-        return score_value
-
-
-    backdrops = sorted(
-        backdrops,
-        key=score,
+    candidates.sort(
+        key=lambda item: item[0],
         reverse=True
     )
 
+    # Visual analysis is intentionally limited to the top candidates
+    # to keep GitHub Actions fast and avoid unnecessary downloads.
+    visual_candidates = candidates[:8]
+
+    best = None
+    best_score = -10**9
+
+    for metadata_score, x in visual_candidates:
+
+        url = img(
+            x.get("file_path"),
+            "w1280"
+        )
+
+        visual = analyze_backdrop(url)
+
+        final_score = (
+            metadata_score
+            + visual["score"]
+        )
+
+        print(
+            "backdrop candidate:",
+            x.get("file_path"),
+            f"metadata={metadata_score:.1f}",
+            f"visual={visual['score']:.1f}",
+            f"final={final_score:.1f}",
+        )
+
+        if final_score > best_score:
+            best_score = final_score
+            best = x
+
+    if not best:
+        best = candidates[0][1]
 
     return img(
-        backdrops[0]["file_path"],
+        best.get("file_path"),
         "w1920"
-    ) if backdrops[0].get("file_path") else None
+    )
 
 
 # ============================================================
@@ -637,20 +892,14 @@ def choose_backdrop(d):
 def choose_logo(d):
 
     images = d.get("images") or {}
-
-    logos = images.get(
-        "logos"
-    ) or []
+    logos = images.get("logos") or []
 
     if not logos:
         return None
 
-
     def score(x):
 
-        language = x.get(
-            "iso_639_1"
-        )
+        language = x.get("iso_639_1")
 
         width = int(
             x.get("width") or 0
@@ -660,30 +909,25 @@ def choose_logo(d):
             x.get("vote_average") or 0
         )
 
-        score_value = (
-            vote_average * 6
-        )
+        score_value = vote_average * 6
 
-        score_value += (
-            min(width, 2000) / 500
-        )
+        score_value += min(
+            width,
+            2000
+        ) / 500
 
-
-        # Prefer English logo where available.
-        if language == "en":
-            score_value += 10
-
-        # Korean is also very useful.
+        # Requested language priority:
+        # Arabic → English → Korean → neutral.
+        if language == "ar":
+            score_value += 20
+        elif language == "en":
+            score_value += 16
         elif language == "ko":
-            score_value += 8
-
-        # Language-neutral logos.
+            score_value += 10
         elif language is None:
-            score_value += 4
-
+            score_value += 5
 
         return score_value
-
 
     logos = sorted(
         logos,
@@ -691,10 +935,8 @@ def choose_logo(d):
         reverse=True
     )
 
-
     if not logos[0].get("file_path"):
         return None
-
 
     return img(
         logos[0]["file_path"],
@@ -710,12 +952,57 @@ def meta(d):
 
     tid = d["id"]
 
-
     cast = (
         (d.get("credits") or {}).get("cast")
         or []
     )
 
+    # --------------------------------------------------------
+    # Arabic localization
+    # --------------------------------------------------------
+
+    arabic_name = None
+    arabic_overview = None
+
+    try:
+        ar = tmdb(
+            f"/tv/{tid}",
+            {
+                "language": "ar-SA"
+            }
+        )
+
+        arabic_name = (
+            ar.get("name")
+            or None
+        )
+
+        arabic_overview = (
+            ar.get("overview")
+            or None
+        )
+
+    except Exception as e:
+        print(
+            "Arabic localization failed",
+            tid,
+            e
+        )
+
+    # Title priority:
+    # Arabic → English → original Korean.
+    title = (
+        arabic_name
+        or d.get("name")
+        or d.get("original_name")
+        or "Unknown"
+    )
+
+    description = (
+        arabic_overview
+        or d.get("overview")
+        or ""
+    )
 
     return {
 
@@ -723,10 +1010,7 @@ def meta(d):
 
         "type": "series",
 
-        "name":
-            d.get("name")
-            or d.get("original_name")
-            or "Unknown",
+        "name": title,
 
         "poster":
             img(
@@ -737,17 +1021,16 @@ def meta(d):
         "posterShape":
             "poster",
 
-        # Hero background.
+        # Clean Hero background.
         "background":
             choose_backdrop(d),
 
-        # Transparent title logo.
+        # Separate transparent title logo.
         "logo":
             choose_logo(d),
 
         "description":
-            d.get("overview")
-            or "",
+            description,
 
         "releaseInfo":
             (
@@ -939,7 +1222,7 @@ manifest = {
         "com.korean.now",
 
     "version":
-        "1.1.1",
+        "1.2.0",
 
     "name":
         "Korean Now",
