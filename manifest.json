@@ -1,0 +1,29 @@
+{
+  "id": "com.korean.now",
+  "version": "1.0.0",
+  "name": "Korean Now",
+  "description": "Current and newly released Korean TV series, with TMDB backdrops and logos optimized for Stremio/Nuvio.",
+  "resources": [
+    "catalog",
+    "meta"
+  ],
+  "types": [
+    "series"
+  ],
+  "idPrefixes": [
+    "krtmdb_"
+  ],
+  "catalogs": [
+    {
+      "type": "series",
+      "id": "korean_now",
+      "name": "🇰🇷 Korean Now",
+      "extra": [
+        {
+          "name": "skip",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
