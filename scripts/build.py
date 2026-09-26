@@ -939,7 +939,7 @@ manifest = {
         "com.korean.now",
 
     "version":
-        "1.1.0",
+        "1.1.1",
 
     "name":
         "Korean Now",
